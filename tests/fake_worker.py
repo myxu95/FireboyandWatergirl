@@ -29,6 +29,9 @@ def assistant(index, context, text="working"):
 
 
 def result(calls):
+    # A resumed session reports totals accumulated since it began; the session being
+    # resumed in the tests is a finished "success" run with 3 calls.
+    calls += 3 if "--resume" in sys.argv else 0
     outcome = os.environ.get("FAKE_OUTCOME", "completed")
     structured = {} if outcome == "none" else {"structured_output": {
         "outcome": outcome, "summary": "all done", "files_changed": ["a.txt"],
@@ -36,8 +39,8 @@ def result(calls):
     }}
     emit({
         **structured,
-        "type": "result", "subtype": "success", "is_error": False, "result": "all done",
-        "total_cost_usd": 0.25, "num_turns": calls, "permission_denials": [],
+        "type": "result", "subtype": "success", "is_error": False, "result": "all done", "session_id": "fake-session",
+        "total_cost_usd": 0.1 * calls, "num_turns": calls, "permission_denials": [],
         "modelUsage": {"fake-model": {
             "inputTokens": 10 * calls, "cacheReadInputTokens": 890 * calls,
             "cacheCreationInputTokens": 100 * calls, "outputTokens": 50 * calls,
@@ -58,12 +61,26 @@ if scenario == "success":
         assistant(i, 1000)
     result(3)
 elif scenario == "echo_env":
-    assistant(0, 1000, text=f"depth={os.environ.get('FWB_DEPTH')} prompt={prompt.strip()}")
+    assistant(0, 1000, text=f"depth={os.environ.get('FWB_DEPTH')} argv={sys.argv[1:]} prompt={prompt.strip()}")
+    result(1)
+elif scenario == "delegate_again":  # try to delegate from inside a task, with FWB_DEPTH filtered out
+    import subprocess
+    env = {k: v for k, v in os.environ.items() if k != "FWB_DEPTH"}
+    nested = subprocess.run(
+        [os.environ["FWB_TEST_PYTHON"], "-m", "fwbridge.cli", "run", "-w", "claude", "--cwd", os.getcwd(),
+         "-p", "nested", "--allow-concurrent"],
+        env=env, capture_output=True, text=True,
+    )
+    assistant(0, 1000, text=f"nested exit={nested.returncode} stderr={nested.stderr.strip()}")
     result(1)
 elif scenario == "grow":  # context doubles on every call and never finishes
     for i in range(1000):
         assistant(i, 1000 * 2 ** min(i, 30))
         time.sleep(0.05)
+elif scenario == "slow":  # quiet for FAKE_SLEEP_S seconds, then succeeds
+    time.sleep(float(os.environ.get("FAKE_SLEEP_S", "5")))
+    assistant(0, 1000)
+    result(1)
 elif scenario == "stall":
     time.sleep(600)
 elif scenario == "crash":

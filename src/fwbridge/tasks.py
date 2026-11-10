@@ -1,4 +1,4 @@
-"""Task lifecycle operations shared by every front end (CLI now, MCP later)."""
+"""Task lifecycle operations shared by every front end (CLI and MCP server)."""
 
 from __future__ import annotations
 
@@ -10,10 +10,11 @@ import sys
 import time
 from pathlib import Path
 
+from .host import detect_host
 from .limits import Limits
 from .store import (
     TERMINAL_STATUSES, TaskError, TaskPaths, is_alive, list_tasks, new_task_dir,
-    proc_start_ticks, read_json, write_json_atomic,
+    proc_start_ticks, read_json, resolve_task, write_json_atomic,
 )
 from .workers import ADAPTERS
 
@@ -37,11 +38,46 @@ def _resolve_autocompact(requested, limits: Limits) -> int | None:
     return requested
 
 
+def _supervisor_ancestors() -> int:
+    """Number of fwb supervisors among this process's ancestors.
+
+    Agent CLIs may filter the environment they pass to tools and MCP servers, so
+    FWB_DEPTH alone cannot be trusted to reach a nested `fwb run`. Process command
+    lines stay readable even for ancestors that make their environment private.
+    """
+    count, pid = 0, os.getppid()
+    for _ in range(64):
+        if pid <= 1:
+            break
+        try:
+            if b"fwbridge.supervisor" in Path(f"/proc/{pid}/cmdline").read_bytes():
+                count += 1
+            status = Path(f"/proc/{pid}/status").read_text()
+        except OSError:
+            break
+        pid = int(next(line.split()[1] for line in status.splitlines() if line.startswith("PPid:")))
+    return count
+
+
+def _resume_target(resume_task: str, worker: str | None, cwd: str | None) -> tuple[TaskPaths, dict, dict]:
+    previous = resolve_task(resume_task)
+    prev_spec, prev_state = read_json(previous.spec), load_state(previous)
+    if prev_state["status"] in ("queued", "running"):
+        raise TaskError(f"task {previous.task_id} is still {prev_state['status']}; wait for it or kill it first")
+    if not prev_state.get("session_id"):
+        raise TaskError(f"task {previous.task_id} has no recorded worker session to resume")
+    if worker is not None and worker != prev_spec["worker"]:
+        raise TaskError(f"task {previous.task_id} ran on {prev_spec['worker']}; a follow-up must use the same worker")
+    if cwd is not None and Path(cwd).resolve() != Path(prev_spec["cwd"]):
+        raise TaskError(f"task {previous.task_id} ran in {prev_spec['cwd']}; a follow-up must use the same directory")
+    return previous, prev_spec, prev_state
+
+
 def create_task(
     *,
-    worker: str,
+    worker: str | None,
     prompt: str,
-    cwd: str,
+    cwd: str | None,
     limits: Limits,
     name: str | None = None,
     model: str | None = None,
@@ -53,9 +89,22 @@ def create_task(
     autocompact_tokens: int | str | None = AUTOCOMPACT_DEFAULT,
     structured: bool = True,
     max_rounds: int = 1,
+    resume_task: str | None = None,
+    notify_command: str | None = None,
 ) -> TaskPaths:
     """Register a task. autocompact_tokens: a token count, None to leave the worker's
-    own default, or AUTOCOMPACT_DEFAULT."""
+    own default, or AUTOCOMPACT_DEFAULT. resume_task: id of a finished task whose worker
+    session receives this prompt as a follow-up; worker and cwd default to that task's."""
+    resume = None
+    if resume_task is not None:
+        if max_rounds > 1:
+            raise TaskError("--max-rounds cannot be combined with --resume: a fresh round would not see the original task")
+        previous, prev_spec, prev_state = _resume_target(resume_task, worker, cwd)
+        worker, cwd = prev_spec["worker"], prev_spec["cwd"]
+        resume = {"of": previous.task_id, "session": prev_state["session_id"]}
+    if worker is None:
+        raise TaskError("choose a worker (--worker claude or --worker codex)")
+    cwd = cwd or "."
     if worker not in ADAPTERS:
         raise TaskError(f"unknown worker '{worker}'; choose from {sorted(ADAPTERS)}")
     adapter = ADAPTERS[worker]
@@ -67,7 +116,7 @@ def create_task(
         raise TaskError("--max-rounds needs the structured result to detect a partial outcome; drop --raw-result")
 
     # A worker that delegates back would loop between the two agents and burn tokens.
-    depth = int(os.environ.get("FWB_DEPTH", "0"))
+    depth = max(int(os.environ.get("FWB_DEPTH") or 0), _supervisor_ancestors())
     max_depth = int(os.environ.get("FWB_MAX_DEPTH", DEFAULT_MAX_DEPTH))
     if depth >= max_depth:
         raise TaskError(
@@ -106,7 +155,15 @@ def create_task(
         "autocompact_tokens": _resolve_autocompact(autocompact_tokens, limits),
         "structured": structured,
         "max_rounds": max_rounds,
+        "resume_of": resume and resume["of"],
+        "resume_session": resume and resume["session"],
+        # Session-cumulative usage before this task, when the worker reports it per session.
+        "resume_baseline": resume and adapter.session_baseline(previous, resume["session"]),
         "limits": limits.to_dict(),
+        # Shell command run when the task ends or first nears a limit.
+        "notify_command": notify_command,
+        # The agent session that asked for this task, if fwb can identify it.
+        "host": detect_host(),
         "depth": depth,
         "created_ts": time.time(),  # Unix epoch seconds
     }

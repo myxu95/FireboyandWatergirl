@@ -70,6 +70,16 @@ class WorkerAdapter:
     def validate(cls, spec: dict) -> None:
         """Raise ValueError when the spec asks for something this worker cannot do."""
 
+    @classmethod
+    def session_baseline(cls, previous, session_id: str) -> dict | None:
+        """Usage a resumed session has already accumulated, as reported in an earlier
+        task's events: {input_uncached, cache_read, cache_write, output, cost_usd}.
+        None when the worker does not report per-session totals or none was found."""
+        return None
+
+    def prepare(self, tracker: Tracker) -> None:
+        """Called right before the worker process starts."""
+
     def build_command(self, executable: str, budget_usd: float | None = None) -> list[str]:
         """budget_usd: cost still available to this process, for workers that support it."""
         raise NotImplementedError

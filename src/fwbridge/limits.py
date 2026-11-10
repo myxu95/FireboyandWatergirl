@@ -23,6 +23,20 @@ class Limits:
     def to_dict(self) -> dict:
         return asdict(self)
 
+    @classmethod
+    def from_overrides(cls, overrides: dict) -> "Limits":
+        """Build limits from caller values: None or a missing key keeps the default, 0 disables."""
+        unknown = set(overrides) - set(cls().to_dict())
+        if unknown:
+            raise ValueError(f"unknown limits: {sorted(unknown)}")
+        chosen = {}
+        for name, default in cls().to_dict().items():
+            value = overrides.get(name)
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must be >= 0 (0 disables the limit)")
+            chosen[name] = default if value is None else (value or None)
+        return cls(**chosen)
+
     def check(self, totals: Totals, elapsed_s: float, idle_s: float) -> tuple[str | None, list[str]]:
         """Return (breach, warnings). A breach means the worker must be stopped now."""
         metrics = [

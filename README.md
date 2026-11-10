@@ -2,18 +2,21 @@
 
 让 Claude Code 和 Codex 互相委派任务的本地工具：一方（host）通过 `fwb` 命令把任务交给另一方（worker）在后台执行，并对长任务和 token 消耗做监控与硬性限额。
 
-当前状态：任务运行器、命令行、token 限额、结构化结果、上下文自动压缩、自动续跑已实现并用两边真实 CLI 验证。MCP 前端尚未实现，见文末路线图。
+当前状态：命令行与 MCP 两种入口、worker 与 host 两侧的 token 监控、限额、结构化结果、上下文自动压缩、自动续跑、追加指令、通知均已实现，并用两边真实 CLI 验证。
 
 ## 环境
 
 ```bash
 mamba env create -f environment.yml   # 环境名 fwbridge，仅依赖标准库 + pytest
 mamba run -n fwbridge python -m pytest -q
+
+# 对真实 CLI 的检查（几分钟，消耗少量 token；CLI 升级后运行）
+FWB_REAL_CLI=1 mamba run -n fwbridge python -m pytest tests/test_real_cli.py -v -s
 ```
 
 命令入口：激活环境后的 `fwb`，或直接用环境内的绝对路径（如 `~/miniforge3/envs/fwbridge/bin/fwb`），后者便于从另一个 agent 调用。
 
-已验证的 CLI 版本：Claude Code 2.1.322、codex-cli 0.167.0。两者的事件格式变化较快，升级后先跑测试，再用真实任务核对一次。
+已验证的 CLI 版本：Claude Code 2.1.322、codex-cli 0.167.0。两者的事件格式变化较快，升级后先跑全部测试，包括上面对真实 CLI 的检查。
 
 ## 用法
 
@@ -22,12 +25,15 @@ mamba run -n fwbridge python -m pytest -q
 fwb run -w claude --cwd /path/to/repo -p "任务描述"
 fwb run -w codex  --cwd /path/to/repo --prompt-file task.md
 
-fwb status            # 最近任务列表
-fwb status <id>       # 单个任务：状态、token、上下文、成本、最近动作
+fwb status            # 最近任务列表和汇总
+fwb status <id>       # 单个任务：状态、worker 与 host 的 token、上下文、成本、最近动作
 fwb wait <id> --timeout 600   # 阻塞等待，退出码见下
 fwb log <id> [-f]     # worker 做过的事（工具调用、回复、上下文压缩）
 fwb result <id> [--json]   # worker 的最终报告
 fwb kill <id>         # 终止任务
+
+# 对已结束的任务追加指令（沿用原任务的 worker、目录和会话）
+fwb run --resume <id> -p "追加的要求"
 ```
 
 `<id>` 可以是完整 id、唯一的前缀或后缀（如末尾 4 位），或 `last`。
@@ -42,7 +48,75 @@ fwb kill <id>         # 终止任务
 | 124 | 等待超时，任务仍在运行 |
 | 2 | 用法错误（未知任务、参数冲突、被保护机制拒绝） |
 
-host 是 agent 时推荐的调用方式：`fwb run` 之后用 `fwb wait --timeout` 阻塞等待，而不是反复轮询 `status`。等待期间 host 不产生模型调用，输出也只有几行，不会撑大 host 的上下文。
+## 接入 agent
+
+host 每查询一次任务状态就是一次模型调用，要重读 host 自己的整个上下文。所以等待任务应当用阻塞的 `wait`，单次等得越久越省，而不是反复查询 `status`。
+
+### host 的 token 监控
+
+`fwb status <id>` 中的 `host:` 一行显示发起任务的 agent 会话在任务运行期间的模型调用次数和 token，与 worker 的消耗分开列出（`status --json` 中为 `host_usage`）。这个数包括 host 在这段时间内做的所有事，不只是等待。
+
+识别 host 的方式：
+
+- Claude Code：读取它传给子进程的 `CLAUDE_CODE_SESSION_ID`，对应 `~/.claude/projects/` 下的会话记录；
+- Codex：沿父进程查找 Codex 正在写入的会话文件（`~/.codex/sessions/` 下的 rollout）。
+
+从普通终端运行 `fwb` 时没有 host，不显示这一行。
+
+### Claude Code 作为 host：命令行
+
+Claude Code 直接在 Bash 里调用 `fwb`（用环境内的绝对路径）。等待有两种方式：
+
+- 以后台方式运行 `fwb wait <id>`，任务结束时 Claude Code 会收到通知，等待期间不产生任何模型调用；
+- 前台运行 `fwb wait <id> --timeout 540`。Bash 工具单次最长 10 分钟，超时后再次调用即可。
+
+实测：Claude Code 用阻塞等待委派一个任务，任务期间 host 的模型调用为 0 次。
+
+### Codex 作为 host：MCP
+
+Codex 的 shell 运行在沙箱里，网络和工作区外的写入都受限，沙箱内的 `fwb run` 无法启动能联网的 worker。MCP 服务进程由 Codex 在沙箱外启动，因此 Codex 应通过 MCP 使用本工具（实测：Codex 在沙箱完全不可用的情况下仍能经 MCP 委派成功）。在 `~/.codex/config.toml` 中加入：
+
+```toml
+[mcp_servers.fwb]
+command = "/path/to/envs/fwbridge/bin/fwb"
+args = ["mcp"]
+# `codex exec` 无法弹出审批，不设置时 MCP 调用会被直接拒绝。
+# 设为 "approve" 后 Codex 可以不经确认就启动 worker；交互使用时可改为 "prompt"。
+default_tools_approval_mode = "approve"
+# Codex 只把少数环境变量（HOME、PATH、USER 等）传给 MCP 服务。
+# 凭据放在环境变量里时，必须在这里列出变量名，否则 worker 会报 "Not logged in"。
+env_vars = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "OPENAI_API_KEY"]
+# 单次 task_wait 的时长须小于工具超时（Codex 默认 300 秒），见下一节。
+tool_timeout_sec = 1000
+
+[mcp_servers.fwb.env]
+FWB_MCP_WAIT_MAX_S = "900"
+```
+
+提供的工具：`delegate`（启动任务，或带 `resume` 追加指令）、`task_wait`、`task_status`、`task_result`、`task_log`、`task_kill`。参数与命令行一致，限额放在 `delegate` 的 `limits` 对象里。`cwd` 必须是绝对路径。
+
+Codex 等待 MCP 调用的机制会直接影响 host 的消耗，详见下一节。
+
+### Codex 等待时的 token 消耗
+
+Codex 0.167 在一个 JavaScript 代码单元里调用 MCP 工具。代码单元默认 30 秒后就把控制权交还模型，模型再用内置的 `wait` 每隔约一分钟查看一次。每次交还都是一次完整的模型调用，要重读 host 的整个上下文。实测一次 5 分钟的阻塞等待引发了 7 次模型调用。
+
+本工具的对策：
+
+- MCP 的 `task_wait` 没有超时参数，每次固定等到上限：默认 280 秒，低于 Codex 默认的 300 秒工具超时；按上面的配置为 900 秒。实测中模型会自行选择 50 秒这样的短等待，所以不把这个选择交给它。需要立即查看时用 `task_status`。
+- `delegate` 的返回文字和 `task_wait` 的说明都会提示 Codex 在代码单元第一行写 `// @exec: {"yield_time_ms": ...}`，让代码单元在整个等待期间不交还控制权。实测 Codex 会照做。
+
+实测数据：worker 由测试替身扮演，只统计 host 的调用；“整个委派”包括启动、等待、读取结果和最后的回复。
+
+| 设置 | 任务时长 | 整个委派的 host 模型调用 | 等待期间被唤醒 |
+|---|---|---|---|
+| 允许模型自选等待时长（改进前） | 4 分钟 | 11 次 | 约每 50 秒一次 |
+| 默认（单次 280 秒） | 4 分钟 | 6 次 | 0 次 |
+| 推荐配置（单次 900 秒） | 10 分钟 | 5 次 | 0 次 |
+
+任务比单次等待更长时，host 每过一个等待周期醒来一次。
+
+Claude Code 也可以注册同一个服务（`claude mcp add --scope user fwb -- /path/to/envs/fwbridge/bin/fwb mcp`），但命令行配合后台等待已经足够。
 
 ### 结构化结果
 
@@ -80,6 +154,22 @@ worker 有时会在任务做完之前停下并报告 `partial`。`--max-rounds N
 - 所有限额（token、调用次数、成本、总时长）跨轮累计；
 - `status` 显示当前轮次和各轮的结论，最终结果取最后一轮的报告。
 
+### 追加指令
+
+`fwb run --resume <id> -p "..."` 把新指令发进一个已结束任务的 worker 会话，worker 保留之前的上下文，适合“按你报告的问题继续修”这类后续请求。它会新建一个任务，`status` 中注明来自哪个任务；worker 和工作目录沿用原任务，不能更改。
+
+两边 CLI 恢复会话后上报的 token 和成本都是整个会话的累计值，包含恢复之前的部分。本工具会扣除恢复前的基线，新任务只计自己的消耗，限额也只针对这部分。基线取不到时（例如原任务被强制终止，没有留下用量报告），总数会包含之前的消耗，`status` 中会注明。
+
+恢复会话会把之前的整个上下文带回来，所以长会话的追加指令比新开任务贵。它不能与 `--max-rounds` 同时使用。
+
+### 通知
+
+`--notify COMMAND`（或环境变量 `FWB_NOTIFY_CMD`）指定一条 shell 命令，在任务结束、以及首次接近某项限额（达到 80%）时由监督进程执行。命令可用的环境变量：`FWB_EVENT`（`finished` 或 `warning`）、`FWB_MESSAGE`、`FWB_TASK_ID`、`FWB_TASK_NAME`、`FWB_STATUS`、`FWB_OUTCOME`。命令失败不影响任务，只在 `status` 中注明。
+
+例如在 `~/.bashrc` 中设置 `export FWB_NOTIFY_CMD='echo "$(date +%T) $FWB_MESSAGE" >> ~/fwb-notify.log'`，或换成发消息的命令。
+
+出于安全考虑，这个选项不通过 MCP 提供：否则沙箱里的 agent 可以借它在沙箱外执行命令。
+
 ### 限额
 
 任一限额触发时，监督进程终止 worker 的整个进程组，任务状态记为 `killed` 并写明原因。达到限额的 80% 时在 `status` 中给出提示。传 `0` 关闭某项限额。
@@ -103,7 +193,7 @@ worker 有时会在任务做完之前停下并报告 `partial`。`--max-rounds N
 
 ### 保护机制
 
-- 禁止嵌套委派：worker 进程带有 `FWB_DEPTH` 标记，在其中再调用 `fwb run` 会被拒绝（`FWB_MAX_DEPTH` 可调整），防止两个 agent 互相委派形成循环。
+- 禁止嵌套委派：在 worker 内部再发起委派（无论通过命令行还是 MCP）会被拒绝，防止两个 agent 互相委派形成循环。检测依据是祖先进程中是否有本工具的监督进程，以及 `FWB_DEPTH` 环境变量；前者不依赖环境变量能否传到下层，因为 agent CLI 启动工具和 MCP 服务时可能会过滤环境变量。`FWB_MAX_DEPTH` 可放宽层数。
 - 工作目录互斥：同一目录已有运行中的任务时拒绝启动新任务（`--allow-concurrent` 可覆盖）。
 
 ## 工作方式
@@ -136,7 +226,9 @@ result.json     结构化结果
 - Claude Code 或终端发起，Claude Code 执行：通过。
 - 终端发起，Codex 执行（`--sandbox danger-full-access`）：通过，实时 token 记录与 Codex 结束时报告的总数一致。
 - Codex 发起（`codex exec -s danger-full-access`），经 `fwb run / wait / result` 委派给 Claude Code：通过。
-- Codex 作为 worker 时再调用 `fwb run`：被嵌套委派保护拒绝，退出码 2。
+- Codex 在默认沙箱下（shell 不可用）经 MCP 委派给 Claude Code：通过，host 会话被识别并统计。
+- Codex 作为 worker 时再调用 `fwb run`：被嵌套委派保护拒绝，退出码 2；经 MCP 调用 `delegate` 同样被拒绝，没有创建任务。
+- 追加指令：两边 worker 都记得上一轮会话中的内容，新任务只计本轮 token。
 - 结构化结果：Claude 完成任务报告 `completed`（退出码 0）；Codex 在沙箱故障下报告 `blocked`（退出码 3）。
 - 自动压缩：Codex 阈值 3 万，压缩 2 次后完成任务。Claude 阈值 10 万，一个需要 50 次调用的顺序读取任务压缩 6 次后完成，单次调用上下文始终低于 7 万；不压缩时会增长到约 25 万。
 - 自动压缩的失败情形：单步并行读入过多内容时，Claude Code 报 "Autocompact is thrashing"，任务状态为 `failed`。
@@ -147,19 +239,19 @@ result.json     结构化结果
 在禁用了非特权用户命名空间的系统上（如 Ubuntu 默认的 `kernel.apparmor_restrict_unprivileged_userns=1`，开发机即如此），Codex 的 bubblewrap 沙箱无法启动。默认模式、`read-only` 和 `workspace-write` 下 Codex 执行不了任何命令和文件修改，只有 `danger-full-access`（无沙箱）可用。在这类系统上：
 
 - Codex 作为 worker 需要加 `--sandbox danger-full-access`；
-- Codex 作为 host 需要以 `-s danger-full-access` 启动才能调用 `fwb`。
+- Codex 作为 host 应通过 MCP 调用（见“接入 agent”），这条路径不受沙箱影响；若改用 shell 调用 `fwb`，需要以 `-s danger-full-access` 启动。
 
 要恢复沙箱，需为 bwrap 配置 AppArmor 例外（需要 sudo）。
 
-## 路线图
+## 未覆盖的部分
 
-- MCP 服务前端：Codex 在沙箱模式下 shell 无法启动带网络的 `claude` 进程，需要经 MCP 发起委派。无沙箱模式下直接调用 `fwb` 已可用，所以只有恢复沙箱后才需要。
-- 续跑：对已结束的任务追加指令（两边 CLI 都支持按会话 id 恢复）。
-- 阈值通知、多任务总览视图。
+- host 一侧只有监控，没有限额：host 的消耗由 host 自己的会话决定，本工具无法中止它。
+- Claude Code 经 MCP（而不是命令行）作为 host 的路径未做真实测试，包括其 MCP 工具超时和环境变量传递。
+- 只支持 Linux：进程检测和 host 识别依赖 `/proc`。
 
 ## 参考
 
 - openai/codex-plugin-cc：Claude Code 调 Codex，经 Codex app-server 通信。
 - sendbird/cc-plugin-codex：反方向，Codex 调 Claude Code，用 `claude -p` 加 `--json-schema` / `--resume`。
 
-两者都提供任务跟踪和结构化的审查结果，都没有 token 记账和限额；本工具的结构化结果做法与它们一致，监控部分是新增的。
+本工具的结构化结果做法参考了它们；重点放在它们之外的部分：两侧的 token 监控、限额和长任务的上下文控制。

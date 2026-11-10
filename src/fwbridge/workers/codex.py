@@ -50,11 +50,40 @@ class CodexAdapter(WorkerAdapter):
         self._live_calls = 0
         self._live_tokens = 0  # tokens of the calls recorded by this process
         self._turn_usage: dict | None = None
+        # Session-cumulative usage before this process, for resumed sessions.
+        self._baseline: CallUsage | None = None
+
+    def prepare(self, tracker: Tracker) -> None:
+        session = self.spec.get("resume_session")
+        if not session:
+            return
+        # A resumed session appends to its rollout file and keeps counting from its old totals.
+        self._rollout = self._find_rollout(session)
+        if self._rollout is None:
+            tracker.note("rollout of the resumed session not found; totals include the session's earlier usage")
+            return
+        data = self._rollout.read_bytes()
+        self._offset = data.rfind(b"\n") + 1
+        for line in data[: self._offset].split(b"\n"):
+            if b"token_count" not in line:
+                continue
+            try:
+                payload = json.loads(line)["payload"]
+                if payload.get("type") == "token_count" and payload.get("info"):
+                    total = payload["info"]["total_token_usage"]
+                    self._seen_total = total["total_tokens"]
+                    self._baseline = _call_usage(total)
+            except (ValueError, KeyError, TypeError, AttributeError):
+                continue
 
     def build_command(self, executable: str, budget_usd: float | None = None) -> list[str]:
         spec = self.spec
-        cmd = [executable, "exec", "--json", "--skip-git-repo-check", "-C", spec["cwd"]]
-        cmd += ["-s", spec.get("sandbox") or "workspace-write"]
+        sandbox = spec.get("sandbox") or "workspace-write"
+        if spec.get("resume_session"):
+            # `exec resume` takes neither -C nor -s; the supervisor sets the cwd.
+            cmd = [executable, "exec", "resume", "--json", "--skip-git-repo-check", "-c", f'sandbox_mode="{sandbox}"']
+        else:
+            cmd = [executable, "exec", "--json", "--skip-git-repo-check", "-C", spec["cwd"], "-s", sandbox]
         if spec.get("model"):
             cmd += ["-m", spec["model"]]
         if spec.get("autocompact_tokens") is not None:
@@ -62,6 +91,8 @@ class CodexAdapter(WorkerAdapter):
         if spec.get("structured"):
             cmd += ["--output-schema", str(RESULT_SCHEMA_PATH)]
         cmd += spec.get("worker_args") or []
+        if spec.get("resume_session"):
+            cmd.append(spec["resume_session"])
         cmd.append("-")  # read the prompt from stdin
         return cmd
 
@@ -158,6 +189,15 @@ class CodexAdapter(WorkerAdapter):
         except (KeyError, TypeError):
             tracker.note("unrecognized usage in codex turn.completed event")
             return
+        if self._baseline is not None:
+            # turn.completed of a resumed session reports the session's cumulative usage.
+            base = self._baseline
+            turn = CallUsage(
+                input_uncached=max(turn.input_uncached - base.input_uncached, 0),
+                cache_read=max(turn.cache_read - base.cache_read, 0),
+                cache_write=max(turn.cache_write - base.cache_write, 0),
+                output=max(turn.output - base.output, 0),
+            )
         totals = tracker.totals
         if self._live_calls == 0:
             # Only the per-turn aggregate is known: per-call context stays unobserved.

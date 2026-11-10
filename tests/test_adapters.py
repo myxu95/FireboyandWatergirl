@@ -4,6 +4,8 @@ import json
 import shutil
 from pathlib import Path
 
+import pytest
+
 from fwbridge.workers import ADAPTERS, Tracker
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -110,6 +112,58 @@ def test_codex_structured_result_is_parsed():
     adapter.on_event({"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(answer)}}, tracker)
     adapter.finalize(tracker)
     assert tracker.structured == answer
+
+
+def test_claude_resume_subtracts_session_baseline(tmp_path):
+    from fwbridge.store import TaskPaths
+    previous = TaskPaths(tmp_path / "prev")
+    previous.dir.mkdir()
+    shutil.copy(FIXTURES / "claude_resume_prev.jsonl", previous.events)
+    session = json.loads((FIXTURES / "claude_resume_prev.jsonl").read_text())["session_id"]
+    baseline = ADAPTERS["claude"].session_baseline(previous, session)
+    assert baseline["cache_write"] == 25287 and baseline["output"] == 4
+
+    adapter = ADAPTERS["claude"]({"resume_session": session, "resume_baseline": baseline})
+    tracker = Tracker()
+    adapter.prepare(tracker)
+    feed(adapter, tracker, "claude_resume.jsonl")
+    totals = tracker.totals
+    assert tracker.result_text == "4711"
+    # The resumed process made one call; the result event's totals cover the whole session.
+    assert totals.api_calls == 1
+    assert (totals.input_uncached, totals.cache_read, totals.cache_write, totals.output) == (4, 17114, 8197, 4)
+    assert totals.input_uncached + totals.cache_read + totals.cache_write == totals.max_context
+    assert totals.cost_usd == pytest.approx(0.00436124 - 0.003163075)
+    assert tracker.notes == []
+
+
+def test_codex_resume_subtracts_session_baseline(tmp_path, monkeypatch):
+    thread = "01a1c584-57d5-7921-93ae-af54e57c280f"
+    day = tmp_path / "sessions" / "2026" / "11" / "10"
+    day.mkdir(parents=True)
+    rollout = day / f"rollout-2026-11-10T20-52-00-{thread}.jsonl"
+    shutil.copy(FIXTURES / "codex_resume_rollout_before.jsonl", rollout)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+
+    adapter, tracker = ADAPTERS["codex"]({"resume_session": thread}), Tracker()
+    adapter.prepare(tracker)
+    with open(rollout, "a") as f:
+        f.write((FIXTURES / "codex_resume_rollout_after.jsonl").read_text())
+    feed(adapter, tracker, "codex_resume_stream.jsonl")
+    adapter.poll(tracker)
+    adapter.finalize(tracker)
+    totals = tracker.totals
+    assert tracker.result_text == "4711"
+    assert totals.api_calls == 1  # the earlier session's call is not counted again
+    assert totals.total_tokens == 21082
+    assert tracker.notes == []  # live and end-of-turn figures agree after the baseline
+
+
+def test_codex_resume_command():
+    cmd = ADAPTERS["codex"]({"resume_session": "abc", "cwd": "/w", "sandbox": "danger-full-access"}).build_command("codex")
+    assert cmd[:3] == ["codex", "exec", "resume"]
+    assert 'sandbox_mode="danger-full-access"' in cmd and "-C" not in cmd
+    assert cmd[-2:] == ["abc", "-"]
 
 
 def test_codex_without_rollout_keeps_context_unobserved(tmp_path, monkeypatch):

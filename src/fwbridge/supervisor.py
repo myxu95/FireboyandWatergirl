@@ -23,6 +23,8 @@ from .workers import ADAPTERS, Tracker
 POLL_INTERVAL_S = 1.0
 STATE_WRITE_INTERVAL_S = 2.0
 TERM_GRACE_S = 10
+# Warnings are sent from the monitoring loop, so a slow command must not hold it up for long.
+NOTIFY_TIMEOUT_S = 10
 
 PREAMBLE = """\
 You are executing a task that another coding agent delegated to you through the fwb bridge.
@@ -32,6 +34,14 @@ You are executing a task that another coding agent delegated to you through the 
 - Your final answer is the only thing the delegating agent reads. Report what you actually did and verified; do not claim success you did not confirm.
 
 Task:
+"""
+
+FOLLOW_UP = """\
+Follow-up from the agent that delegated the task above. The same rules apply: work
+autonomously, do not delegate, stop and report if blocked, and report only what you
+actually did and verified. Your final report should cover this follow-up.
+
+Follow-up:
 """
 
 CONTINUATION = """
@@ -91,6 +101,7 @@ class Supervisor:
         self.cancel_requested = threading.Event()
         self.proc: subprocess.Popen | None = None
         self.started = time.time()
+        self.warned: set[str] = set()  # limits already reported as approaching
         self.state = {
             "id": self.spec["id"],
             "worker": self.spec["worker"],
@@ -113,6 +124,24 @@ class Supervisor:
             "unparsed_lines": 0,
         }
 
+    def notify(self, event: str, message: str) -> None:
+        """Run the user's notification command, if any. Its failure never stops the task."""
+        command = self.spec.get("notify_command")
+        if not command:
+            return
+        state = self.state
+        env = dict(
+            os.environ, FWB_EVENT=event, FWB_MESSAGE=message, FWB_TASK_ID=self.spec["id"],
+            FWB_TASK_NAME=self.spec.get("name") or "", FWB_STATUS=state["status"], FWB_OUTCOME=state.get("outcome") or "",
+        )
+        try:
+            done = subprocess.run(command, shell=True, env=env, stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True, timeout=NOTIFY_TIMEOUT_S)
+            if done.returncode != 0:
+                self.tracker.note(f"notify command exited with {done.returncode}: {done.stderr.strip()[:200]}")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self.tracker.note(f"notify command failed: {exc}")
+
     def write_state(self) -> None:
         tracker = self.tracker
         self.state.update(
@@ -133,7 +162,8 @@ class Supervisor:
         signal.signal(signal.SIGINT, lambda *_: self.cancel_requested.set())
         state, tracker, spec = self.state, self.tracker, self.spec
         try:
-            worker_input = PREAMBLE + self.paths.prompt.read_text()
+            preamble = FOLLOW_UP if spec.get("resume_session") else PREAMBLE
+            worker_input = preamble + self.paths.prompt.read_text()
             while True:
                 self._run_worker(worker_input)
                 if state["kill_reason"]:
@@ -180,7 +210,17 @@ class Supervisor:
             state["error"] = "supervisor error: " + traceback.format_exc(limit=5)
             traceback.print_exc()
         state["ended_ts"] = time.time()
+        summary = f"task {spec['id']} {state['status']}"
+        if state.get("outcome"):
+            summary += f" ({state['outcome']})"
+        if state.get("kill_reason") or state.get("error"):
+            summary += f": {state.get('kill_reason') or state.get('error')}"
+        # Publish the final state before notifying, so waiters are not held up by the command.
         self.write_state()
+        notes_before = len(tracker.notes)
+        self.notify("finished", summary)
+        if len(tracker.notes) != notes_before:
+            self.write_state()
         return state["status"]
 
     def _run_worker(self, worker_input: str) -> None:
@@ -193,6 +233,7 @@ class Supervisor:
         command = adapter.build_command(spec["worker_bin"], budget_usd=budget)
         env = dict(os.environ, FWB_DEPTH=str(spec["depth"] + 1), FWB_TASK_ID=spec["id"])
         paths.worker_input.write_text(worker_input)
+        adapter.prepare(tracker)
 
         with open(paths.worker_input, "rb") as stdin, open(paths.stderr, "ab") as stderr, open(paths.events, "ab") as events:
             proc = self.proc = subprocess.Popen(
@@ -232,6 +273,11 @@ class Supervisor:
                     break
 
                 breach, state["warnings"] = self.limits.check(tracker.totals, now - self.started, now - last_event)
+                for warning in state["warnings"]:
+                    kind = warning.split()[0]
+                    if kind not in self.warned:
+                        self.warned.add(kind)
+                        self.notify("warning", f"task {spec['id']}: {warning}")
                 if self.cancel_requested.is_set() or paths.cancel.exists():
                     breach = "cancelled by user"
                 if breach:

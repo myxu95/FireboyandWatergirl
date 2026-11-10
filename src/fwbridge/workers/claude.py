@@ -34,6 +34,36 @@ class ClaudeAdapter(WorkerAdapter):
         if window is not None and not AUTOCOMPACT_MIN <= window <= AUTOCOMPACT_MAX:
             raise ValueError(f"claude accepts --autocompact between {AUTOCOMPACT_MIN} and {AUTOCOMPACT_MAX} tokens, got {window}")
 
+    @classmethod
+    def session_baseline(cls, previous, session_id: str) -> dict | None:
+        # A resumed session reports usage and cost accumulated since its creation.
+        baseline = None
+        if not previous.events.exists():
+            return None
+        with open(previous.events) as events:
+            for line in events:
+                if '"result"' not in line:
+                    continue
+                try:
+                    event = json.loads(line)
+                    if event.get("type") != "result" or event.get("session_id") != session_id:
+                        continue
+                    models = list(event["modelUsage"].values())
+                    baseline = {
+                        "input_uncached": sum(m["inputTokens"] for m in models),
+                        "cache_read": sum(m["cacheReadInputTokens"] for m in models),
+                        "cache_write": sum(m["cacheCreationInputTokens"] for m in models),
+                        "output": sum(m["outputTokens"] for m in models),
+                        "cost_usd": event.get("total_cost_usd") or 0.0,
+                    }
+                except (ValueError, KeyError, TypeError, AttributeError):
+                    continue
+        return baseline
+
+    def prepare(self, tracker: Tracker) -> None:
+        if self.spec.get("resume_session") and not self.spec.get("resume_baseline"):
+            tracker.note("the resumed session's earlier usage is unknown, so the final totals include it")
+
     def build_command(self, executable: str, budget_usd: float | None = None) -> list[str]:
         spec = self.spec
         # The prompt arrives on stdin.
@@ -43,6 +73,8 @@ class ClaudeAdapter(WorkerAdapter):
             cmd += ["--allowedTools", *spec["allowed_tools"]]
         if spec.get("model"):
             cmd += ["--model", spec["model"]]
+        if spec.get("resume_session"):
+            cmd += ["--resume", spec["resume_session"]]
         if budget_usd is not None:
             cmd += ["--max-budget-usd", f"{budget_usd:.4f}"]
         if spec.get("autocompact_tokens") is not None:
@@ -104,14 +136,19 @@ class ClaudeAdapter(WorkerAdapter):
             # Some errors (e.g. compaction thrashing) arrive with subtype "success".
             subtype = event.get("subtype")
             tracker.error = clip(detail if subtype == "success" and detail else f"{subtype}: {detail}", 500)
+            if "Not logged in" in str(detail):
+                tracker.note("claude found no credentials: if they live in environment variables, the program that "
+                             "started fwb may have filtered them out (e.g. Codex MCP servers need env_vars)")
         else:
             tracker.outcome = "success"
         if isinstance(event.get("result"), str):
             tracker.result_text = event["result"]
         if isinstance(event.get("structured_output"), dict):
             tracker.structured = event["structured_output"]
+        baseline = self.spec.get("resume_baseline") or {}
         if event.get("total_cost_usd") is not None:
-            tracker.totals.cost_usd = tracker.cost_base + event["total_cost_usd"]
+            own_cost = event["total_cost_usd"] - baseline.get("cost_usd", 0.0)
+            tracker.totals.cost_usd = tracker.cost_base + max(own_cost, 0.0)
         for denial in event.get("permission_denials") or []:
             tracker.permission_denials.append(clip(f"{denial.get('tool_name')}: {json.dumps(denial.get('tool_input'), ensure_ascii=False)}"))
 
@@ -121,10 +158,10 @@ class ClaudeAdapter(WorkerAdapter):
         try:
             models = list(model_usage.values())
             final = [
-                sum(m["inputTokens"] for m in models),
-                sum(m["cacheReadInputTokens"] for m in models),
-                sum(m["cacheCreationInputTokens"] for m in models),
-                sum(m["outputTokens"] for m in models),
+                sum(m["inputTokens"] for m in models) - baseline.get("input_uncached", 0),
+                sum(m["cacheReadInputTokens"] for m in models) - baseline.get("cache_read", 0),
+                sum(m["cacheCreationInputTokens"] for m in models) - baseline.get("cache_write", 0),
+                sum(m["outputTokens"] for m in models) - baseline.get("output", 0),
             ]
             # Replace this process's streamed contribution, keeping earlier rounds intact.
             totals = tracker.totals
