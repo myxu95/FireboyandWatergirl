@@ -1,0 +1,5 @@
+{"type": "thread.started", "thread_id": "01a1c55e-814b-7453-9187-2847af9c3018"}
+{"type": "turn.started"}
+{"type": "item.completed", "item": {"id": "item_0", "type": "agent_message", "text": "我会执行该命令。\n"}}
+{"type": "item.completed", "item": {"id": "item_1", "type": "agent_message", "text": "无法执行：沙箱权限错误（Operation not permitted）。"}}
+{"type": "turn.completed", "usage": {"input_tokens": 72857, "cached_input_tokens": 48512, "cache_write_input_tokens": 0, "output_tokens": 315, "reasoning_output_tokens": 209}}

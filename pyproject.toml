@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fwbridge"
+version = "0.1.0"
+description = "Run Claude Code and Codex tasks on each other's behalf, with long-task and token monitoring"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+fwb = "fwbridge.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+fwbridge = ["*.json"]
