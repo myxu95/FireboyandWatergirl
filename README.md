@@ -220,6 +220,8 @@ This option is deliberately not offered over MCP, because it would let a sandbox
 
 ## How it works
 
+For an illustrated walkthrough (architecture diagram, the life of a task, and a chart of measured context per call), open [docs/index.html](docs/index.html) in a browser.
+
 There is no daemon. Each task is a directory under `~/.local/state/fwbridge/tasks/<id>/` (or `$FWB_HOME/tasks/`) and one detached supervisor process that runs the worker, parses its event stream and keeps `state.json` current:
 
 ```
