@@ -1,0 +1,558 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How fwbridge Works</title>
+<meta name="description" content="How fwbridge lets Claude Code and Codex delegate tasks to each other while watching what both sides spend in tokens.">
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --border: rgba(11, 11, 11, 0.10);
+  --code-bg: #f0efec;
+  --accent: #2a78d6;
+  --accent-wash: rgba(42, 120, 214, 0.10);
+  --link: #256abf;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --ink: #f0efec;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: rgba(255, 255, 255, 0.10);
+    --code-bg: #262624;
+    --accent: #3987e5;
+    --accent-wash: rgba(57, 135, 229, 0.12);
+    --link: #6da7ec;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface: #1a1a19;
+  --ink: #f0efec;
+  --ink-2: #c3c2b7;
+  --muted: #898781;
+  --grid: #2c2c2a;
+  --axis: #383835;
+  --border: rgba(255, 255, 255, 0.10);
+  --code-bg: #262624;
+  --accent: #3987e5;
+  --accent-wash: rgba(57, 135, 229, 0.12);
+  --link: #6da7ec;
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink);
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+main { max-width: 880px; margin: 0 auto; padding: 48px 16px 64px; }
+a { color: var(--link); text-underline-offset: 2px; }
+h1 { font-size: 2.25rem; line-height: 1.15; margin: 0 0 4px; letter-spacing: -0.01em; }
+h2 { font-size: 1.4rem; line-height: 1.3; margin: 56px 0 12px; padding-top: 8px; border-top: 1px solid var(--grid); }
+h3 { font-size: 1.05rem; margin: 28px 0 8px; }
+p, li { color: var(--ink); }
+.subtitle { color: var(--ink-2); font-size: 1.15rem; margin: 0 0 20px; }
+.lead { font-size: 1.1rem; }
+.meta { color: var(--muted); font-size: 0.875rem; }
+.note { color: var(--ink-2); font-size: 0.95rem; }
+code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.88em; }
+code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; white-space: nowrap; }
+code.wrap { white-space: normal; overflow-wrap: anywhere; }
+pre { background: var(--code-bg); padding: 14px 16px; border-radius: 8px; overflow-x: auto; line-height: 1.5; }
+pre code { background: none; padding: 0; }
+nav.toc { margin: 24px 0 0; padding: 14px 18px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; }
+nav.toc ol { margin: 0; padding-left: 20px; columns: 2; column-gap: 32px; }
+nav.toc li { margin: 2px 0; break-inside: avoid; }
+@media (max-width: 560px) { nav.toc ol { columns: 1; } }
+
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; }
+.cards { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 16px 0; }
+@media (max-width: 680px) { .cards { grid-template-columns: 1fr; } }
+.card h3 { margin-top: 0; }
+.card ul { padding-left: 20px; margin: 8px 0 0; }
+.card .cmd { color: var(--ink-2); font-size: 0.9rem; margin: 0; }
+
+figure { margin: 20px 0; }
+figcaption { color: var(--ink-2); font-size: 0.9rem; margin-top: 8px; }
+.diagram { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 8px; overflow-x: auto; }
+.diagram svg { display: block; width: 100%; min-width: 640px; height: auto; }
+.scroll-hint { display: none; color: var(--muted); font-size: 0.85rem; margin: 6px 0 0; }
+@media (max-width: 680px) { .scroll-hint { display: block; } }
+.d-box { fill: var(--page); stroke: var(--axis); stroke-width: 1.5; }
+.d-box.key { stroke: var(--accent); }
+.d-title { fill: var(--ink); font: 600 15px system-ui, -apple-system, "Segoe UI", sans-serif; }
+.d-text { fill: var(--ink-2); font: 13px system-ui, -apple-system, "Segoe UI", sans-serif; }
+.d-label { fill: var(--muted); font: 12px system-ui, -apple-system, "Segoe UI", sans-serif; }
+.d-arrow { stroke: var(--ink-2); stroke-width: 1.5; fill: none; }
+.d-head { fill: var(--ink-2); }
+
+ol.steps { counter-reset: step; list-style: none; padding: 0; margin: 16px 0; }
+ol.steps > li { counter-increment: step; position: relative; padding: 0 0 18px 44px; }
+ol.steps > li::before {
+  content: counter(step); position: absolute; left: 0; top: 0;
+  width: 28px; height: 28px; border-radius: 50%;
+  background: var(--surface); border: 1px solid var(--axis); color: var(--ink);
+  font-weight: 600; font-size: 0.9rem; display: grid; place-items: center;
+}
+ol.steps > li > strong:first-child { display: block; }
+ol.steps ul { padding-left: 20px; margin: 6px 0 0; }
+
+.table-wrap { overflow-x: auto; margin: 16px 0; }
+table { border-collapse: collapse; width: 100%; font-size: 0.95rem; }
+th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+th { color: var(--ink-2); font-weight: 600; font-size: 0.85rem; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+.chart-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px 16px 12px; }
+.chart-title { font-weight: 600; margin: 0; }
+.chart-sub { color: var(--ink-2); font-size: 0.875rem; margin: 2px 0 10px; }
+.chart { position: relative; }
+.chart svg { display: block; width: 100%; height: 280px; overflow: visible; }
+.chart svg:focus { outline: none; }
+.chart svg:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 4px; }
+.c-grid { stroke: var(--grid); stroke-width: 1; }
+.c-base { stroke: var(--axis); stroke-width: 1; }
+.c-tick { fill: var(--muted); font: 11px system-ui, -apple-system, "Segoe UI", sans-serif; font-variant-numeric: tabular-nums; }
+.c-ref { stroke: var(--ink-2); stroke-width: 1; }
+.c-ref-label { fill: var(--ink-2); font: 12px system-ui, -apple-system, "Segoe UI", sans-serif; }
+.c-note { fill: var(--ink-2); font: 12px system-ui, -apple-system, "Segoe UI", sans-serif; }
+.c-area { fill: var(--accent-wash); }
+.c-line { stroke: var(--accent); stroke-width: 2; fill: none; stroke-linejoin: round; stroke-linecap: round; }
+.c-dot { fill: var(--accent); stroke: var(--surface); stroke-width: 2; }
+.c-cross { stroke: var(--muted); stroke-width: 1; }
+.tooltip {
+  position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; padding: 6px 10px; font-size: 0.85rem; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+  white-space: nowrap; transform: translate(-50%, calc(-100% - 12px));
+}
+.tooltip[hidden] { display: none; }
+.tooltip .value { font-weight: 600; color: var(--ink); }
+.tooltip .label { color: var(--ink-2); }
+details { margin-top: 10px; }
+summary { cursor: pointer; color: var(--ink-2); font-size: 0.9rem; }
+details .table-wrap { max-height: 320px; overflow-y: auto; }
+
+footer { margin-top: 64px; padding-top: 16px; border-top: 1px solid var(--grid); color: var(--muted); font-size: 0.875rem; }
+</style>
+</head>
+<body>
+<main>
+
+<header>
+  <h1>fwbridge</h1>
+  <p class="subtitle">How Claude Code and Codex hand work to each other without losing track of the bill</p>
+  <p class="lead">fwbridge lets one coding agent (Claude Code or Codex) hand a task to the other and run it in the background. It watches what the worker spends, stops it when a limit is reached, and also reports what the delegating agent spends while it waits.</p>
+  <p class="meta">Behaviour and measurements on this page: Claude Code 2.1.322 and codex-cli 0.167.0, November 2026. Source: <a href="https://github.com/myxu95/FireboyandWatergirl">github.com/myxu95/FireboyandWatergirl</a>.</p>
+  <nav class="toc" aria-label="Contents">
+    <ol>
+      <li><a href="#why">Why it exists</a></li>
+      <li><a href="#architecture">Architecture</a></li>
+      <li><a href="#lifecycle">Life of a task</a></li>
+      <li><a href="#adapters">Worker adapters</a></li>
+      <li><a href="#tokens">Tokens and long tasks</a></li>
+      <li><a href="#host">The host side</a></li>
+      <li><a href="#guards">Guards</a></li>
+      <li><a href="#disk">On disk</a></li>
+      <li><a href="#code">Reading the code</a></li>
+    </ol>
+  </nav>
+</header>
+
+<section id="why">
+  <h2>Why it exists</h2>
+  <p>A delegated task gets expensive in two places.</p>
+  <ul>
+    <li><strong>The worker.</strong> Every model call re-reads the whole conversation, so the input a long task consumes grows roughly with the square of its number of calls. Left alone, a task that keeps going can burn an extraordinary number of tokens, mostly as cache reads.</li>
+    <li><strong>The host.</strong> Each time the delegating agent checks on the task, it makes a model call that re-reads <em>its own</em> context. Checking in every minute for an hour means sixty such calls.</li>
+  </ul>
+  <p>fwbridge puts a supervisor between the two agents that keeps books on both sides and enforces hard limits on the worker.</p>
+</section>
+
+<section id="architecture">
+  <h2>Architecture: no daemon</h2>
+  <p>Three kinds of processes cooperate through one directory per task.</p>
+  <figure>
+    <div class="diagram">
+      <svg viewBox="0 0 800 330" role="img" aria-labelledby="arch-title arch-desc">
+        <title id="arch-title">fwbridge architecture</title>
+        <desc id="arch-desc">The host agent calls fwb, which creates a task directory and spawns a supervisor, then returns. The supervisor launches the worker, reads its JSON event stream and writes state into the task directory. The host reads status, waits and results from the task directory.</desc>
+        <defs>
+          <marker id="head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path class="d-head" d="M0 0 L10 5 L0 10 z"/>
+          </marker>
+        </defs>
+
+        <rect class="d-box" x="20" y="40" width="180" height="72" rx="10"/>
+        <text class="d-title" x="110" y="70" text-anchor="middle">Host agent</text>
+        <text class="d-text" x="110" y="92" text-anchor="middle">Claude Code or Codex</text>
+
+        <rect class="d-box" x="305" y="40" width="180" height="72" rx="10"/>
+        <text class="d-title" x="395" y="70" text-anchor="middle">fwb</text>
+        <text class="d-text" x="395" y="92" text-anchor="middle">CLI or MCP server</text>
+
+        <rect class="d-box key" x="590" y="40" width="190" height="72" rx="10"/>
+        <text class="d-title" x="685" y="70" text-anchor="middle">Supervisor</text>
+        <text class="d-text" x="685" y="92" text-anchor="middle">one per task, detached</text>
+
+        <rect class="d-box" x="305" y="228" width="180" height="84" rx="10"/>
+        <text class="d-title" x="395" y="256" text-anchor="middle">Task directory</text>
+        <text class="d-text" x="395" y="277" text-anchor="middle">task.json · state.json</text>
+        <text class="d-text" x="395" y="296" text-anchor="middle">events.jsonl · result.md</text>
+
+        <rect class="d-box" x="590" y="228" width="190" height="84" rx="10"/>
+        <text class="d-title" x="685" y="256" text-anchor="middle">Worker</text>
+        <text class="d-text" x="685" y="277" text-anchor="middle">claude -p</text>
+        <text class="d-text" x="685" y="296" text-anchor="middle">or codex exec</text>
+
+        <!-- host -> fwb -->
+        <line class="d-arrow" x1="200" y1="76" x2="303" y2="76" marker-end="url(#head)"/>
+        <text class="d-label" x="252" y="66" text-anchor="middle">run / delegate</text>
+
+        <!-- fwb -> supervisor -->
+        <line class="d-arrow" x1="485" y1="76" x2="588" y2="76" marker-end="url(#head)"/>
+        <text class="d-label" x="537" y="66" text-anchor="middle">spawn</text>
+        <text class="d-label" x="537" y="96" text-anchor="middle">then return id</text>
+
+        <!-- fwb -> task dir -->
+        <line class="d-arrow" x1="395" y1="112" x2="395" y2="226" marker-end="url(#head)"/>
+        <text class="d-label" x="403" y="160">create</text>
+
+        <!-- supervisor <-> worker -->
+        <line class="d-arrow" x1="660" y1="112" x2="660" y2="226" marker-end="url(#head)"/>
+        <text class="d-label" x="652" y="166" text-anchor="end">prompt on stdin</text>
+        <text class="d-label" x="652" y="182" text-anchor="end">kill on limit</text>
+        <line class="d-arrow" x1="712" y1="228" x2="712" y2="114" marker-end="url(#head)"/>
+        <text class="d-label" x="720" y="166">JSONL</text>
+        <text class="d-label" x="720" y="182">events</text>
+
+        <!-- supervisor -> task dir -->
+        <line class="d-arrow" x1="600" y1="112" x2="487" y2="240" marker-end="url(#head)"/>
+        <text class="d-label" x="532" y="212">writes state</text>
+        <text class="d-label" x="532" y="228">every 2 s</text>
+
+        <!-- task dir -> host -->
+        <line class="d-arrow" x1="305" y1="270" x2="112" y2="114" marker-end="url(#head)"/>
+        <text class="d-label" x="226" y="222" text-anchor="end">status · wait · result</text>
+        <text class="d-label" x="240" y="238" text-anchor="end">read the files only</text>
+      </svg>
+    </div>
+    <p class="scroll-hint">Scroll the diagram sideways to see all of it.</p>
+    <figcaption>Only the supervisor writes task state. Every other command reads files, so the host can exit or the terminal can close and the task carries on.</figcaption>
+  </figure>
+  <ul>
+    <li><strong>Host:</strong> the agent that asks for work. Claude Code calls the <code>fwb</code> CLI from its shell. Codex uses the MCP server (<code>fwb mcp</code>) because its shell runs inside a sandbox that cannot start a networked worker.</li>
+    <li><strong>Supervisor:</strong> one detached process per task. It starts the worker, reads its event stream, keeps the token books, enforces limits and writes <code>state.json</code>.</li>
+    <li><strong>Worker:</strong> <code>claude -p</code> or <code>codex exec</code>, doing the actual task.</li>
+  </ul>
+</section>
+
+<section id="lifecycle">
+  <h2>Life of a task</h2>
+  <ol class="steps">
+    <li>
+      <strong>Entry</strong>
+      The CLI (<code>cmd_run</code> in <a href="https://github.com/myxu95/FireboyandWatergirl/blob/main/src/fwbridge/cli.py">cli.py</a>) and the MCP server (<code>_delegate</code> in <a href="https://github.com/myxu95/FireboyandWatergirl/blob/main/src/fwbridge/mcp_server.py">mcp_server.py</a>) only parse arguments. Both call <code>create_task</code> in <a href="https://github.com/myxu95/FireboyandWatergirl/blob/main/src/fwbridge/tasks.py">tasks.py</a>, so the two front ends behave identically.
+    </li>
+    <li>
+      <strong>Checks and registration</strong>
+      <code>create_task</code> refuses to start a task when:
+      <ul>
+        <li>the caller is itself running inside a delegated task, which would let the two agents bounce work back and forth;</li>
+        <li>another task is already running in the same directory;</li>
+        <li>the options do not fit the worker (only Claude Code reports cost, for example).</li>
+      </ul>
+      For a follow-up (<code>--resume</code>) it looks up the earlier task's worker session and the usage that session had already accumulated. It records which agent session is the host, then writes <code>task.json</code> (the immutable request), <code>prompt.txt</code> and a <code>queued</code> <code>state.json</code>.
+    </li>
+    <li>
+      <strong>Detach</strong>
+      <code>spawn_supervisor</code> starts <code class="wrap">python -m fwbridge.supervisor &lt;task dir&gt;</code> in its own session, and the command returns the task id at once.
+    </li>
+    <li>
+      <strong>Supervise</strong>
+      <code>Supervisor.run</code> in <a href="https://github.com/myxu95/FireboyandWatergirl/blob/main/src/fwbridge/supervisor.py">supervisor.py</a> puts a fixed preamble in front of the prompt: work autonomously, do not delegate, stop and say so when blocked, report only what was verified. <code>_run_worker</code> asks the worker's adapter for the command line and starts the worker in its own process group. A reader thread queues its stdout lines, and once per second the loop:
+      <ul>
+        <li>hands each event to the adapter, which updates the token books;</li>
+        <li>lets the adapter read side channels (the Codex session file);</li>
+        <li>checks the limits, and on a breach kills the whole process group and marks the task <code>killed</code>;</li>
+        <li>writes <code>state.json</code> every two seconds.</li>
+      </ul>
+    </li>
+    <li>
+      <strong>Finish</strong>
+      A task ends with two layers of result:
+      <ul>
+        <li><code>status</code> (<code>succeeded</code>, <code>failed</code> or <code>killed</code>) is what happened to the process;</li>
+        <li><code>outcome</code> (<code>completed</code>, <code>partial</code>, <code>blocked</code> or <code>failed</code>) is the worker's own verdict, taken from its structured report.</li>
+      </ul>
+      A <code>partial</code> outcome with rounds left starts a fresh session seeded with the previous report. Then <code>result.md</code> and <code>result.json</code> are written, the final state is published, and the notification command runs.
+    </li>
+    <li>
+      <strong>Read back</strong>
+      <code>status</code>, <code>wait</code>, <code>result</code> and <code>log</code> only read files. <code>wait_task</code> re-reads <code>state.json</code> once a second and makes no model calls, so a host blocked in <code>fwb wait</code> spends nothing. If the supervisor dies, <code>load_state</code> sees that its process is gone and reports the task as <code>orphaned</code>; <code>fwb kill</code> cleans up.
+    </li>
+  </ol>
+</section>
+
+<section id="adapters">
+  <h2>Worker adapters</h2>
+  <p>Everything specific to one CLI lives in its adapter under <a href="https://github.com/myxu95/FireboyandWatergirl/tree/main/src/fwbridge/workers">workers/</a>. Each implements the same small interface: <code>build_command</code>, <code>on_event</code>, <code>poll</code>, <code>finalize</code> and <code>prepare</code>. The supervisor never needs to know which worker it is running. Every rule below was established against recorded output of the real CLIs, which the tests replay.</p>
+  <div class="cards">
+    <div class="card">
+      <h3>Claude Code</h3>
+      <p class="cmd"><code class="wrap">claude -p --output-format stream-json</code></p>
+      <ul>
+        <li>One model call is streamed as several events that repeat the same message id, so calls are deduplicated by id.</li>
+        <li>Streamed output counts run low, and compaction calls are not streamed at all. The final result event's totals are authoritative.</li>
+        <li>Structured result through <code>--json-schema</code>, cost from <code>total_cost_usd</code>, budget through <code>--max-budget-usd</code>.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Codex</h3>
+      <p class="cmd"><code class="wrap">codex exec --json</code></p>
+      <ul>
+        <li>The stdout stream reports usage only once, when the turn ends.</li>
+        <li>Live per-call usage comes from the session file Codex writes under <code>~/.codex/sessions</code>, which the adapter follows as it grows.</li>
+        <li>Structured result through <code>--output-schema</code>, compaction threshold through <code class="wrap">model_auto_compact_token_limit</code>.</li>
+      </ul>
+    </div>
+  </div>
+  <p>Both CLIs report a resumed session's usage as a running total since the session began. The adapters record the total before resuming and subtract it, so a follow-up task is charged only for its own calls.</p>
+</section>
+
+<section id="tokens">
+  <h2>Tokens and long tasks</h2>
+  <p>Each model call is recorded as four parts: uncached input, cache read, cache write and output. The first three add up to the call's <strong>context</strong>, which is everything the model had to read. Context size is what drives runaway cost, so it is the quantity fwbridge watches most closely. Control comes in three layers, from soft to hard:</p>
+  <ol>
+    <li><strong>Autocompaction</strong> (default 120,000 tokens). The worker summarises its own history and carries on.</li>
+    <li><strong>Context limit</strong> (default 200,000 tokens). If compaction does not keep up, the task is stopped.</li>
+    <li><strong>Backstops.</strong> Total tokens (10 million), model calls (200), cost (Claude Code only, off by default), silence (20 minutes) and wall time (4 hours). The status shows a warning at 80% of any limit.</li>
+  </ol>
+
+  <figure class="chart-card">
+    <p class="chart-title">Context per model call in a long Claude Code task</p>
+    <p class="chart-sub">Thousands of tokens, rounded. Haiku reading four 1,500-line files in 150-line chunks with <code>--autocompact 100000</code>; 50 calls.</p>
+    <div class="chart" id="ctx-chart">
+      <div class="tooltip" id="ctx-tip" hidden><div class="value"></div><div class="label"></div></div>
+    </div>
+    <figcaption>Dots mark the six calls after which Claude Code compacted its history. Each compaction cut the context back to about 34,000 tokens, so it never passed 69,000. Without compaction, every call would have carried the whole history. Hover or use the arrow keys to read values.</figcaption>
+    <details>
+      <summary>Data table</summary>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th class="num">Call</th><th class="num">Context (thousand tokens)</th><th>Compacted afterwards</th></tr></thead>
+          <tbody id="ctx-table"></tbody>
+        </table>
+      </div>
+    </details>
+  </figure>
+
+  <p>Two ways to continue work that did not finish:</p>
+  <ul>
+    <li><code>--max-rounds N</code> starts fresh sessions that carry only the previous round's report. It is cheap, but the new session knows only what that report says.</li>
+    <li><code>--resume TASK</code> reopens the same worker session. The worker remembers everything, and pays to re-read all of it.</li>
+  </ul>
+</section>
+
+<section id="host">
+  <h2>The host side</h2>
+  <p>When a task is created, fwbridge records which agent session asked for it. <code>fwb status</code> then reports that session's model calls and tokens during the task, next to the worker's.</p>
+  <ul>
+    <li><strong>Claude Code</strong> passes <code>CLAUDE_CODE_SESSION_ID</code> to its child processes, which leads to the session transcript under <code>~/.claude/projects</code>.</li>
+    <li><strong>Codex</strong> has no such variable. fwbridge walks up the process tree to the Codex process and finds the session file it holds open.</li>
+  </ul>
+
+  <h3>The Codex wake-up problem</h3>
+  <p>Codex 0.167 calls MCP tools from a JavaScript cell that hands control back to the model after 30 seconds. The model then checks again about once a minute, and every hand-back is a full model call. In one measurement a single five-minute wait cost seven model calls. fwbridge counters this in two ways:</p>
+  <ul>
+    <li>The MCP <code>task_wait</code> tool has no timeout argument. Given one, the model chose 50-second waits.</li>
+    <li>Its description, and the reply to <code>delegate</code>, tell Codex to begin the cell with <code>// @exec: {"yield_time_ms": …}</code>, so the cell stays blocked for the whole wait.</li>
+  </ul>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Setting</th><th class="num">Task length</th><th class="num">Host model calls, whole delegation</th><th>Wake-ups while waiting</th></tr></thead>
+      <tbody>
+        <tr><td>Model chooses the wait length (before)</td><td class="num">4 min</td><td class="num">11</td><td>about every 50 s</td></tr>
+        <tr><td>Default, 280 s per wait</td><td class="num">4 min</td><td class="num">6</td><td>none</td></tr>
+        <tr><td>Recommended config, 900 s per wait</td><td class="num">10 min</td><td class="num">5</td><td>none</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">A stand-in worker played the task so that only host calls were counted. The whole delegation includes starting the task, reading the result and the final reply. With Claude Code as host and a blocking <code>fwb wait</code>, the measured host calls during the task were zero.</p>
+</section>
+
+<section id="guards">
+  <h2>Guards</h2>
+  <ul>
+    <li><strong>No nested delegation.</strong> Delegating from inside a task is refused, through the CLI and through MCP alike. Detection looks for an fwb supervisor among the caller's ancestor processes, because agent CLIs filter the environment they pass to tools and MCP servers.</li>
+    <li><strong>One task per directory,</strong> so two agents never edit the same tree at once (<code>--allow-concurrent</code> overrides).</li>
+    <li><strong>No permission-skipping defaults.</strong> Claude Code runs with <code>acceptEdits</code>, Codex with the <code>workspace-write</code> sandbox, unless the caller asks otherwise.</li>
+    <li><strong>Notifications stay out of MCP.</strong> A notification command runs as a shell command outside any sandbox, so only the CLI and the <code>FWB_NOTIFY_CMD</code> variable can set one.</li>
+    <li><strong>Reports are claims.</strong> The structured report is the worker's own account, and the host should check whatever matters.</li>
+  </ul>
+</section>
+
+<section id="disk">
+  <h2>On disk</h2>
+  <p>Each task is a directory under <code>~/.local/state/fwbridge/tasks/</code> (or <code>$FWB_HOME/tasks/</code>):</p>
+<pre><code>task.json         the request; never changes
+prompt.txt        the prompt as given
+worker_input.txt  what the worker actually received (preamble + prompt)
+state.json        live state, written only by the supervisor
+events.jsonl      the worker's raw event stream
+usage.jsonl       one line per model call
+stderr.log        the worker's stderr
+result.md         final report, readable form
+result.json       final report, structured</code></pre>
+</section>
+
+<section id="code">
+  <h2>Reading the code</h2>
+  <ol>
+    <li><a href="https://github.com/myxu95/FireboyandWatergirl/blob/main/src/fwbridge/tasks.py">tasks.py</a> shows how a task is created and how its state is read. This is the whole flow in one file.</li>
+    <li><a href="https://github.com/myxu95/FireboyandWatergirl/blob/main/src/fwbridge/supervisor.py">supervisor.py</a> holds the run loop and the round logic.</li>
+    <li><a href="https://github.com/myxu95/FireboyandWatergirl/blob/main/src/fwbridge/workers/claude.py">workers/claude.py</a> pairs best with <a href="https://github.com/myxu95/FireboyandWatergirl/blob/main/tests/test_adapters.py">tests/test_adapters.py</a>, which replays recorded streams and shows what each parsing rule handles.</li>
+    <li>The outer layers can wait until needed: <a href="https://github.com/myxu95/FireboyandWatergirl/blob/main/src/fwbridge/mcp_server.py">mcp_server.py</a>, <a href="https://github.com/myxu95/FireboyandWatergirl/blob/main/src/fwbridge/host.py">host.py</a> and <a href="https://github.com/myxu95/FireboyandWatergirl/blob/main/src/fwbridge/report.py">report.py</a>.</li>
+  </ol>
+  <p>Setup, every option and the full list of verified scenarios are in the <a href="https://github.com/myxu95/FireboyandWatergirl#readme">README</a>.</p>
+</section>
+
+<footer>
+  fwbridge · <a href="https://github.com/myxu95/FireboyandWatergirl">source on GitHub</a> · measurements taken with Claude Code 2.1.322 and codex-cli 0.167.0
+</footer>
+
+</main>
+
+<script>
+(function () {
+  // Measured per-call context (thousands of tokens, rounded) from usage.jsonl of one task.
+  var data = [26, 32, 38, 43, 49, 55, 61, 67, 33, 39, 45, 45, 46, 51, 57, 63, 69, 33, 39, 45, 51, 57, 63, 64, 64,
+              34, 39, 45, 51, 57, 62, 68, 34, 40, 46, 46, 46, 52, 58, 64, 34, 40, 45, 51, 57, 63, 34, 34, 34, 35];
+  var Y_MAX = 100, REF = 100, HEIGHT = 280;
+  var M = { top: 22, right: 12, bottom: 30, left: 40 };
+  var NS = "http://www.w3.org/2000/svg";
+  // A call is followed by a compaction when the next call's context drops sharply.
+  var compacted = data.map(function (v, i) { return i < data.length - 1 && data[i + 1] < v - 15; });
+
+  var host = document.getElementById("ctx-chart");
+  var tip = document.getElementById("ctx-tip");
+  var svg, xOf, yOf, cross, focusDot, current = -1;
+
+  function el(name, attrs, parent) {
+    var node = document.createElementNS(NS, name);
+    for (var k in attrs) node.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(node);
+    return node;
+  }
+
+  function render() {
+    var width = host.clientWidth;
+    if (!width) return;
+    if (svg) svg.remove();
+    var w = width - M.left - M.right, h = HEIGHT - M.top - M.bottom;
+    xOf = function (i) { return M.left + (i / (data.length - 1)) * w; };
+    yOf = function (v) { return M.top + h - (v / Y_MAX) * h; };
+
+    svg = el("svg", { viewBox: "0 0 " + width + " " + HEIGHT, tabindex: "0", role: "img",
+      "aria-label": "Context per model call over 50 calls, rising to between 63 and 69 thousand tokens and dropping to about 34 thousand after each of six compactions" });
+    host.insertBefore(svg, tip);
+
+    [0, 25, 50, 75, 100].forEach(function (t) {
+      el("line", { class: t === 0 ? "c-base" : "c-grid", x1: M.left, x2: M.left + w, y1: yOf(t), y2: yOf(t) }, svg);
+      el("text", { class: "c-tick", x: M.left - 8, y: yOf(t) + 4, "text-anchor": "end" }, svg).textContent = t === 0 ? "0" : t + "K";
+    });
+    [1, 10, 20, 30, 40, 50].forEach(function (c) {
+      el("text", { class: "c-tick", x: xOf(c - 1), y: M.top + h + 18, "text-anchor": "middle" }, svg).textContent = c;
+    });
+
+    el("line", { class: "c-ref", x1: M.left, x2: M.left + w, y1: yOf(REF), y2: yOf(REF) }, svg);
+    el("text", { class: "c-ref-label", x: M.left + w, y: yOf(REF) - 6, "text-anchor": "end" }, svg).textContent = "--autocompact 100000";
+
+    var pts = data.map(function (v, i) { return xOf(i) + "," + yOf(v); });
+    el("path", { class: "c-area", d: "M" + xOf(0) + "," + yOf(0) + " L" + pts.join(" L") + " L" + xOf(data.length - 1) + "," + yOf(0) + " Z" }, svg);
+    el("path", { class: "c-line", d: "M" + pts.join(" L") }, svg);
+    data.forEach(function (v, i) {
+      if (compacted[i]) el("circle", { class: "c-dot", cx: xOf(i), cy: yOf(v), r: 4.5 }, svg);
+    });
+    var peak = data.indexOf(Math.max.apply(null, data));
+    el("text", { class: "c-note", x: xOf(peak), y: yOf(data[peak]) - 12, "text-anchor": "middle" }, svg).textContent = "peak " + data[peak] + "K";
+    var last = data.length - 1;
+    if (w >= 480) {  // on narrow charts the end label would sit on the line
+      el("text", { class: "c-note", x: xOf(last), y: yOf(data[last]) - 12, "text-anchor": "end" }, svg).textContent = data[last] + "K";
+    }
+
+    cross = el("line", { class: "c-cross", y1: M.top, y2: M.top + h, visibility: "hidden" }, svg);
+    focusDot = el("circle", { class: "c-dot", r: 5, visibility: "hidden" }, svg);
+    var hit = el("rect", { x: M.left, y: M.top, width: w, height: h, fill: "transparent" }, svg);
+
+    function indexAt(evt) {
+      var box = svg.getBoundingClientRect();
+      var x = (evt.clientX - box.left) * (width / box.width);
+      return Math.max(0, Math.min(data.length - 1, Math.round(((x - M.left) / w) * (data.length - 1))));
+    }
+    hit.addEventListener("pointermove", function (evt) { show(indexAt(evt)); });
+    hit.addEventListener("pointerleave", hide);
+    svg.addEventListener("focus", function () { show(current < 0 ? 0 : current); });
+    svg.addEventListener("blur", hide);
+    svg.addEventListener("keydown", function (evt) {
+      if (evt.key === "ArrowRight") { show(Math.min(data.length - 1, current + 1)); evt.preventDefault(); }
+      if (evt.key === "ArrowLeft") { show(Math.max(0, current - 1)); evt.preventDefault(); }
+    });
+    if (current >= 0 && !tip.hidden) show(current);
+  }
+
+  function show(i) {
+    current = i;
+    var x = xOf(i), y = yOf(data[i]);
+    cross.setAttribute("x1", x); cross.setAttribute("x2", x); cross.setAttribute("visibility", "visible");
+    focusDot.setAttribute("cx", x); focusDot.setAttribute("cy", y); focusDot.setAttribute("visibility", "visible");
+    var scale = svg.getBoundingClientRect().width / host.clientWidth;
+    tip.querySelector(".value").textContent = data[i] + "K tokens";
+    tip.querySelector(".label").textContent = "Call " + (i + 1) + (compacted[i] ? " · compacted afterwards" : "");
+    tip.hidden = false;
+    var half = tip.offsetWidth / 2;
+    tip.style.left = Math.max(half, Math.min(host.clientWidth - half, x * scale)) + "px";
+    tip.style.top = (y * scale) + "px";
+  }
+
+  function hide() {
+    tip.hidden = true;
+    if (cross) cross.setAttribute("visibility", "hidden");
+    if (focusDot) focusDot.setAttribute("visibility", "hidden");
+  }
+
+  var body = document.getElementById("ctx-table");
+  data.forEach(function (v, i) {
+    var row = document.createElement("tr");
+    [String(i + 1), String(v), compacted[i] ? "yes" : ""].forEach(function (text, col) {
+      var cell = document.createElement("td");
+      if (col < 2) cell.className = "num";
+      cell.textContent = text;
+      row.appendChild(cell);
+    });
+    body.appendChild(row);
+  });
+
+  render();
+  if (window.ResizeObserver) new ResizeObserver(render).observe(host);
+  else window.addEventListener("resize", render);
+})();
+</script>
+</body>
+</html>
